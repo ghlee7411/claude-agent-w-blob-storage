@@ -1,0 +1,99 @@
+Python의 Global Interpreter Lock (GIL) 완전 가이드
+=====================================================
+
+1. GIL이란 무엇인가?
+-------------------
+
+Python Global Interpreter Lock (GIL)은 CPython 인터프리터에서 한 번에 하나의 스레드만
+Python 바이트코드를 실행할 수 있도록 하는 뮤텍스(mutex)입니다. 이것은 Python 객체에 대한
+접근을 보호하여 여러 스레드가 동시에 Python 바이트코드를 실행하는 것을 방지합니다.
+
+GIL은 레퍼런스 카운트의 동시 수정과 기타 내부 데이터 구조에 대한 경쟁 조건(race condition)을
+방지하고 스레드 안전성을 보장합니다.
+
+2. Python에 GIL이 존재하는 이유
+-----------------------------
+
+GIL은 실수가 아닌 의도적인 설계 선택이었습니다. CPython은 1990년대 초반, 멀티코어
+프로세서가 드물었던 시기에 설계되었습니다. 당시에 GIL은 쉽고 안전한 솔루션이었습니다.
+
+주요 이유:
+- 메모리 관리 단순화: Python의 메모리 관리는 레퍼런스 카운팅에 기반합니다. GIL 없이는
+  여러 스레드가 동시에 레퍼런스 카운트를 수정할 수 있어 메모리 누수나 조기 해제가
+  발생할 수 있습니다.
+- C 확장 호환성: 많은 C 확장 모듈들이 스레드 안전하지 않은 방식으로 작성되었습니다.
+  GIL은 이러한 확장들이 수정 없이 작동할 수 있게 해줍니다.
+- 단순성: 싱글 스레드 프로그램에서는 GIL로 인한 오버헤드가 거의 없습니다.
+
+3. 성능에 미치는 영향
+--------------------
+
+GIL의 영향은 싱글 스레드 프로그램을 실행하는 개발자에게는 보이지 않지만, CPU 바운드
+및 멀티스레드 코드에서는 성능 병목이 될 수 있습니다.
+
+CPU 바운드 작업:
+- 수학 계산, 이미지 처리 등 연산 집약적 작업에서 멀티스레딩의 이점을 얻기 어렵습니다
+- GIL이 병렬 실행을 방지하므로 CPU 바운드 작업에는 멀티스레딩이 적합하지 않습니다
+
+I/O 바운드 작업:
+- 파일 읽기/쓰기, 네트워크 요청 등의 I/O 작업에서는 GIL이 해제됩니다
+- 따라서 I/O 바운드 작업에서는 멀티스레딩이 여전히 유용합니다
+
+4. GIL 우회 방법
+---------------
+
+4.1 멀티프로세싱 (multiprocessing)
+Python의 multiprocessing 모듈은 여러 프로세스를 실행할 수 있게 해주며, 각 프로세스는
+자체 Python 인터프리터를 가집니다. 스레드와 달리 프로세스는 동일한 메모리 공간을
+공유하지 않으므로 GIL이 필요하지 않습니다.
+
+예제:
+from multiprocessing import Pool
+
+def cpu_intensive_task(n):
+    return sum(i * i for i in range(n))
+
+if __name__ == '__main__':
+    with Pool(4) as p:
+        results = p.map(cpu_intensive_task, [10000000] * 4)
+
+4.2 C 확장에서 GIL 해제
+일부 Python 라이브러리, 특히 C나 Cython으로 작성된 라이브러리는 계산 중에 수동으로
+GIL을 해제할 수 있습니다. NumPy, SciPy 같은 라이브러리가 이 방식을 사용합니다.
+
+4.3 asyncio 사용
+비동기 프로그래밍을 통해 I/O 바운드 작업에서 높은 동시성을 달성할 수 있습니다.
+
+5. Python 3.13: Free-Threaded 빌드 (PEP 703)
+-------------------------------------------
+
+Python 3.13에서는 PEP 703의 일환으로 실험적인 "free-threaded" CPython 빌드가
+도입되었습니다. 이 빌드는 개발자가 GIL 없이 Python을 컴파일할 수 있게 하여
+여러 CPU 코어에서 Python 바이트코드의 진정한 병렬 실행을 가능하게 합니다.
+
+GIL은 CPython 빌드와 python.org 다운로드의 기본값으로 유지됩니다. 새로운 빌드
+구성 플래그 --disable-gil이 configure 스크립트에 추가되어 GIL 없이 실행을
+지원하는 CPython을 빌드할 수 있습니다.
+
+그러나 Python 3.13의 GIL 없는 빌드는 아직 실험적 단계입니다.
+
+6. GIL과 관련된 모범 사례
+------------------------
+
+- CPU 바운드 작업에는 multiprocessing 사용
+- I/O 바운드 작업에는 threading 또는 asyncio 사용
+- NumPy 같은 GIL을 해제하는 라이브러리 활용
+- 작업 유형에 따라 적절한 동시성 모델 선택
+
+7. 결론
+-------
+
+GIL은 Python의 독특한 특성 중 하나로, 장단점이 있습니다. 단순성과 C 확장 호환성을
+제공하지만 CPU 바운드 멀티스레드 애플리케이션에서는 제한이 됩니다. 다양한 우회 방법이
+있으며, Python 3.13의 free-threaded 빌드는 미래에 이 제한을 해결할 수 있는
+가능성을 보여줍니다.
+
+참고 자료:
+- Real Python: What Is the Python Global Interpreter Lock (GIL)?
+- PEP 703: Making the Global Interpreter Lock Optional in CPython
+- Python Wiki: GlobalInterpreterLock
