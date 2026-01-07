@@ -1,19 +1,28 @@
 """Knowledge base tools for Claude Agent SDK.
 
 This module provides tools for managing the file-based knowledge base
-with support for concurrent access and optimistic locking.
+with support for concurrent access, optimistic locking, and optimized
+search using inverted indexes.
 """
 
+import asyncio
 import json
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from storage import BaseStorage, StorageResult
 
 
 class KnowledgeBaseTools:
-    """Tools for interacting with the knowledge base."""
+    """Tools for interacting with the knowledge base.
+
+    Performance optimizations:
+    - Index-based search instead of full file scans
+    - Inverted index for O(1) keyword lookups
+    - Parallel I/O with asyncio.gather
+    - In-memory index caching
+    """
 
     def __init__(self, storage: BaseStorage):
         """Initialize knowledge base tools.
@@ -22,6 +31,233 @@ class KnowledgeBaseTools:
             storage: Storage backend to use
         """
         self.storage = storage
+        self._index_cache: Optional[Dict] = None
+        self._inverted_index_cache: Optional[Dict] = None
+
+    # =========================================================================
+    # Index Management (Optimized)
+    # =========================================================================
+
+    async def get_index(self, force_reload: bool = False) -> Dict[str, Any]:
+        """Get the current topics index with caching.
+
+        Args:
+            force_reload: Force reload from storage
+
+        Returns:
+            Dict with index data
+        """
+        if self._index_cache is not None and not force_reload:
+            return {"success": True, "index": self._index_cache}
+
+        result = await self.storage.read_json("_index/topics_index.json")
+
+        if result.success:
+            self._index_cache = result.data
+            return {"success": True, "index": result.data}
+        else:
+            # Try to rebuild if not found
+            rebuild_result = await self.rebuild_index()
+            if rebuild_result["success"]:
+                return {"success": True, "index": self._index_cache}
+            return {"success": False, "error": "Index not available"}
+
+    async def get_inverted_index(self, force_reload: bool = False) -> Dict[str, Any]:
+        """Get the inverted index for keyword lookups.
+
+        Args:
+            force_reload: Force reload from storage
+
+        Returns:
+            Dict with inverted index data
+        """
+        if self._inverted_index_cache is not None and not force_reload:
+            return {"success": True, "index": self._inverted_index_cache}
+
+        result = await self.storage.read_json("_index/inverted_index.json")
+
+        if result.success:
+            self._inverted_index_cache = result.data
+            return {"success": True, "index": result.data}
+        else:
+            # Try to rebuild if not found
+            rebuild_result = await self.rebuild_index()
+            if rebuild_result["success"]:
+                return {"success": True, "index": self._inverted_index_cache}
+            return {"success": False, "error": "Inverted index not available"}
+
+    async def rebuild_index(self) -> Dict[str, Any]:
+        """Rebuild all indexes from metadata files using parallel I/O.
+
+        Returns:
+            Dict with index stats
+        """
+        all_meta = await self.storage.list("topics", "*.meta.json")
+
+        if not all_meta.success:
+            return {"success": False, "error": all_meta.error}
+
+        # Parallel read all metadata files
+        read_tasks = [self.storage.read_json(path) for path in all_meta.data]
+        results = await asyncio.gather(*read_tasks, return_exceptions=True)
+
+        # Build main index and inverted index
+        topics_index = {
+            "rebuilt_at": datetime.utcnow().isoformat() + "Z",
+            "topics": {}
+        }
+
+        inverted_index = {
+            "rebuilt_at": datetime.utcnow().isoformat() + "Z",
+            "keywords": {},      # keyword -> [topic_ids]
+            "titles": {},        # word in title -> [topic_ids]
+            "categories": {}     # category -> [topic_ids]
+        }
+
+        for meta_path, result in zip(all_meta.data, results):
+            if isinstance(result, Exception):
+                continue
+            if not result.success:
+                continue
+
+            meta = result.data
+            topic_id = meta.get("topic_id")
+            if not topic_id:
+                continue
+
+            # Main index entry
+            topics_index["topics"][topic_id] = {
+                "title": meta.get("title"),
+                "keywords": meta.get("keywords", []),
+                "last_modified": meta.get("last_modified"),
+                "related_topics": meta.get("related_topics", [])
+            }
+
+            # Inverted index: keywords
+            for keyword in meta.get("keywords", []):
+                keyword_lower = keyword.lower()
+                if keyword_lower not in inverted_index["keywords"]:
+                    inverted_index["keywords"][keyword_lower] = []
+                if topic_id not in inverted_index["keywords"][keyword_lower]:
+                    inverted_index["keywords"][keyword_lower].append(topic_id)
+
+            # Inverted index: title words
+            title = meta.get("title", "")
+            for word in title.lower().split():
+                if len(word) >= 2:  # Skip very short words
+                    if word not in inverted_index["titles"]:
+                        inverted_index["titles"][word] = []
+                    if topic_id not in inverted_index["titles"][word]:
+                        inverted_index["titles"][word].append(topic_id)
+
+            # Inverted index: categories
+            if "/" in topic_id:
+                category = topic_id.split("/")[0]
+                if category not in inverted_index["categories"]:
+                    inverted_index["categories"][category] = []
+                if topic_id not in inverted_index["categories"][category]:
+                    inverted_index["categories"][category].append(topic_id)
+
+        # Write indexes in parallel
+        write_tasks = [
+            self.storage.write_json("_index/topics_index.json", topics_index),
+            self.storage.write_json("_index/inverted_index.json", inverted_index)
+        ]
+        await asyncio.gather(*write_tasks)
+
+        # Update caches
+        self._index_cache = topics_index
+        self._inverted_index_cache = inverted_index
+
+        return {
+            "success": True,
+            "topic_count": len(topics_index["topics"]),
+            "keyword_count": len(inverted_index["keywords"]),
+            "message": f"Index rebuilt with {len(topics_index['topics'])} topics, {len(inverted_index['keywords'])} keywords"
+        }
+
+    def invalidate_cache(self):
+        """Invalidate all cached indexes."""
+        self._index_cache = None
+        self._inverted_index_cache = None
+
+    async def _update_indexes_for_topic(
+        self,
+        topic_id: str,
+        title: str,
+        keywords: List[str],
+        remove: bool = False
+    ):
+        """Incrementally update indexes when a topic changes.
+
+        Args:
+            topic_id: Topic ID being changed
+            title: Topic title
+            keywords: Topic keywords
+            remove: If True, remove from indexes instead of adding
+        """
+        # Load indexes if not cached
+        await self.get_index()
+        await self.get_inverted_index()
+
+        if self._index_cache is None or self._inverted_index_cache is None:
+            return
+
+        if remove:
+            # Remove from main index
+            if topic_id in self._index_cache.get("topics", {}):
+                del self._index_cache["topics"][topic_id]
+
+            # Remove from inverted indexes
+            for keyword in keywords:
+                kw_lower = keyword.lower()
+                if kw_lower in self._inverted_index_cache.get("keywords", {}):
+                    topics = self._inverted_index_cache["keywords"][kw_lower]
+                    if topic_id in topics:
+                        topics.remove(topic_id)
+
+            for word in title.lower().split():
+                if word in self._inverted_index_cache.get("titles", {}):
+                    topics = self._inverted_index_cache["titles"][word]
+                    if topic_id in topics:
+                        topics.remove(topic_id)
+        else:
+            # Update main index
+            self._index_cache["topics"][topic_id] = {
+                "title": title,
+                "keywords": keywords,
+                "last_modified": datetime.utcnow().isoformat() + "Z"
+            }
+
+            # Update inverted indexes
+            for keyword in keywords:
+                kw_lower = keyword.lower()
+                if kw_lower not in self._inverted_index_cache["keywords"]:
+                    self._inverted_index_cache["keywords"][kw_lower] = []
+                if topic_id not in self._inverted_index_cache["keywords"][kw_lower]:
+                    self._inverted_index_cache["keywords"][kw_lower].append(topic_id)
+
+            for word in title.lower().split():
+                if len(word) >= 2:
+                    if word not in self._inverted_index_cache["titles"]:
+                        self._inverted_index_cache["titles"][word] = []
+                    if topic_id not in self._inverted_index_cache["titles"][word]:
+                        self._inverted_index_cache["titles"][word].append(topic_id)
+
+            # Category
+            if "/" in topic_id:
+                category = topic_id.split("/")[0]
+                if category not in self._inverted_index_cache["categories"]:
+                    self._inverted_index_cache["categories"][category] = []
+                if topic_id not in self._inverted_index_cache["categories"][category]:
+                    self._inverted_index_cache["categories"][category].append(topic_id)
+
+        # Persist indexes asynchronously
+        write_tasks = [
+            self.storage.write_json("_index/topics_index.json", self._index_cache),
+            self.storage.write_json("_index/inverted_index.json", self._inverted_index_cache)
+        ]
+        await asyncio.gather(*write_tasks)
 
     # =========================================================================
     # Topic Management
@@ -39,8 +275,10 @@ class KnowledgeBaseTools:
         md_path = f"topics/{topic_path}.md"
         meta_path = f"topics/{topic_path}.meta.json"
 
-        content_result = await self.storage.read(md_path)
-        meta_result = await self.storage.read_json(meta_path)
+        # Parallel read content and metadata
+        content_task = self.storage.read(md_path)
+        meta_task = self.storage.read_json(meta_path)
+        content_result, meta_result = await asyncio.gather(content_task, meta_task)
 
         if not content_result.success:
             return {
@@ -90,9 +328,13 @@ class KnowledgeBaseTools:
         existing_meta = await self.storage.read_json(meta_path)
         version = 1
         existing_citations = []
+        old_keywords = []
+        old_title = ""
         if existing_meta.success:
             version = existing_meta.data.get("version", 0) + 1
             existing_citations = existing_meta.data.get("citations", [])
+            old_keywords = existing_meta.data.get("keywords", [])
+            old_title = existing_meta.data.get("title", "")
 
         # Write content with optimistic concurrency
         write_result = await self.storage.write(md_path, content, etag)
@@ -125,6 +367,11 @@ class KnowledgeBaseTools:
                 "success": False,
                 "error": f"Failed to write metadata: {meta_result.error}"
             }
+
+        # Update indexes incrementally
+        if old_keywords or old_title:
+            await self._update_indexes_for_topic(topic_path, old_title, old_keywords, remove=True)
+        await self._update_indexes_for_topic(topic_path, title, keywords, remove=False)
 
         return {
             "success": True,
@@ -186,13 +433,25 @@ class KnowledgeBaseTools:
         Returns:
             Dict with success status
         """
+        # Get metadata for index cleanup
+        meta_result = await self.storage.read_json(f"topics/{topic_path}.meta.json")
+        old_title = ""
+        old_keywords = []
+        if meta_result.success:
+            old_title = meta_result.data.get("title", "")
+            old_keywords = meta_result.data.get("keywords", [])
+
         md_path = f"topics/{topic_path}.md"
         meta_path = f"topics/{topic_path}.meta.json"
 
-        md_result = await self.storage.delete(md_path)
-        meta_result = await self.storage.delete(meta_path)
+        # Parallel delete
+        md_task = self.storage.delete(md_path)
+        meta_task = self.storage.delete(meta_path)
+        md_result, meta_result = await asyncio.gather(md_task, meta_task)
 
         if md_result.success:
+            # Update indexes
+            await self._update_indexes_for_topic(topic_path, old_title, old_keywords, remove=True)
             return {
                 "success": True,
                 "message": f"Topic '{topic_path}' deleted"
@@ -204,11 +463,11 @@ class KnowledgeBaseTools:
             }
 
     # =========================================================================
-    # Search and Discovery
+    # Search and Discovery (Optimized with Indexes)
     # =========================================================================
 
     async def list_topics(self, category: str = "") -> Dict[str, Any]:
-        """List all topics, optionally filtered by category.
+        """List all topics using index (no file scanning).
 
         Args:
             category: Category path (e.g., "python") or empty for all
@@ -216,22 +475,25 @@ class KnowledgeBaseTools:
         Returns:
             Dict with list of topics
         """
-        prefix = f"topics/{category}" if category else "topics"
-        result = await self.storage.list(prefix, "*.meta.json")
+        index_result = await self.get_index()
+        if not index_result["success"]:
+            return {"success": False, "error": "Index not available"}
 
-        if not result.success:
-            return {"success": False, "error": result.error}
-
+        topics_data = index_result["index"].get("topics", {})
         topics = []
-        for meta_path in result.data:
-            meta_result = await self.storage.read_json(meta_path)
-            if meta_result.success:
-                topics.append({
-                    "path": meta_result.data.get("topic_id"),
-                    "title": meta_result.data.get("title"),
-                    "keywords": meta_result.data.get("keywords", []),
-                    "last_modified": meta_result.data.get("last_modified")
-                })
+
+        for topic_id, data in topics_data.items():
+            # Filter by category if specified
+            if category:
+                if not topic_id.startswith(f"{category}/"):
+                    continue
+
+            topics.append({
+                "path": topic_id,
+                "title": data.get("title"),
+                "keywords": data.get("keywords", []),
+                "last_modified": data.get("last_modified")
+            })
 
         return {
             "success": True,
@@ -240,7 +502,7 @@ class KnowledgeBaseTools:
         }
 
     async def search_topics(self, query: str) -> Dict[str, Any]:
-        """Search topics by content or keywords.
+        """Search topics using inverted index (O(1) keyword lookup).
 
         Args:
             query: Search query
@@ -248,48 +510,86 @@ class KnowledgeBaseTools:
         Returns:
             Dict with matching topics
         """
-        # First, search in content
-        content_result = await self.storage.search(query, "topics", "*.md")
+        inv_index_result = await self.get_inverted_index()
+        index_result = await self.get_index()
 
-        # Also search in metadata keywords
-        all_meta = await self.storage.list("topics", "*.meta.json")
-        keyword_matches = []
+        if not inv_index_result["success"] or not index_result["success"]:
+            return {"success": False, "error": "Index not available"}
 
-        if all_meta.success:
-            query_lower = query.lower()
-            for meta_path in all_meta.data:
-                meta_result = await self.storage.read_json(meta_path)
-                if meta_result.success:
-                    meta = meta_result.data
-                    keywords = [k.lower() for k in meta.get("keywords", [])]
-                    title = meta.get("title", "").lower()
+        inv_index = inv_index_result["index"]
+        main_index = index_result["index"]
+        query_lower = query.lower()
+        query_words = query_lower.split()
 
-                    if any(query_lower in k for k in keywords) or query_lower in title:
-                        keyword_matches.append({
-                            "path": meta.get("topic_id"),
-                            "title": meta.get("title"),
-                            "keywords": meta.get("keywords", []),
-                            "match_type": "keyword"
-                        })
+        # Collect matching topic IDs from inverted index
+        matching_ids: Set[str] = set()
 
-        # Combine results
+        # Search in keywords
+        for word in query_words:
+            if word in inv_index.get("keywords", {}):
+                matching_ids.update(inv_index["keywords"][word])
+            # Partial match for keywords
+            for keyword, topic_ids in inv_index.get("keywords", {}).items():
+                if word in keyword or keyword in word:
+                    matching_ids.update(topic_ids)
+
+        # Search in titles
+        for word in query_words:
+            if word in inv_index.get("titles", {}):
+                matching_ids.update(inv_index["titles"][word])
+
+        # Build results with metadata from main index
         results = []
+        topics_data = main_index.get("topics", {})
 
-        # Add content matches
-        if content_result.success:
-            for match in content_result.data:
-                path = match["path"].replace("topics/", "").replace(".md", "")
+        for topic_id in matching_ids:
+            if topic_id in topics_data:
+                data = topics_data[topic_id]
                 results.append({
-                    "path": path,
-                    "match_type": "content",
-                    "snippets": match["matches"]
+                    "path": topic_id,
+                    "title": data.get("title"),
+                    "keywords": data.get("keywords", []),
+                    "match_type": "index"
                 })
 
-        # Add keyword matches (avoid duplicates)
-        content_paths = {r["path"] for r in results}
-        for km in keyword_matches:
-            if km["path"] not in content_paths:
-                results.append(km)
+        return {
+            "success": True,
+            "query": query,
+            "count": len(results),
+            "results": results
+        }
+
+    async def search_topics_fulltext(self, query: str, limit: int = 20) -> Dict[str, Any]:
+        """Full-text search in content (fallback, slower).
+
+        Use this when index search doesn't find results.
+
+        Args:
+            query: Search query
+            limit: Maximum results to return
+
+        Returns:
+            Dict with matching topics
+        """
+        # First try index-based search
+        index_results = await self.search_topics(query)
+        if index_results["success"] and index_results["count"] > 0:
+            return index_results
+
+        # Fallback to content search (limited)
+        content_result = await self.storage.search(query, "topics", "*.md")
+
+        if not content_result.success:
+            return {"success": False, "error": content_result.error}
+
+        results = []
+        for match in content_result.data[:limit]:
+            path = match["path"].replace("topics/", "").replace(".md", "")
+            results.append({
+                "path": path,
+                "match_type": "content",
+                "snippets": match["matches"]
+            })
 
         return {
             "success": True,
@@ -299,7 +599,7 @@ class KnowledgeBaseTools:
         }
 
     async def find_related_topics(self, topic_path: str) -> Dict[str, Any]:
-        """Find topics related to a given topic.
+        """Find topics related to a given topic using index.
 
         Args:
             topic_path: Path of the source topic
@@ -307,37 +607,54 @@ class KnowledgeBaseTools:
         Returns:
             Dict with related topics
         """
-        topic = await self.read_topic(topic_path)
-        if not topic["success"]:
-            return topic
+        index_result = await self.get_index()
+        if not index_result["success"]:
+            return {"success": False, "error": "Index not available"}
 
-        metadata = topic.get("metadata", {})
-        related_paths = metadata.get("related_topics", [])
-        keywords = metadata.get("keywords", [])
+        topics_data = index_result["index"].get("topics", {})
+
+        if topic_path not in topics_data:
+            return {
+                "success": False,
+                "error": f"Topic not found: {topic_path}"
+            }
+
+        source_data = topics_data[topic_path]
+        related_paths = source_data.get("related_topics", [])
+        keywords = source_data.get("keywords", [])
 
         related = []
 
-        # Get explicitly related topics
+        # Get explicitly related topics from index
         for path in related_paths:
-            rel_topic = await self.read_topic(path)
-            if rel_topic["success"]:
+            if path in topics_data:
                 related.append({
                     "path": path,
-                    "title": rel_topic.get("metadata", {}).get("title", path),
+                    "title": topics_data[path].get("title", path),
                     "relation": "explicit"
                 })
 
-        # Find topics with similar keywords
+        # Find topics with similar keywords using inverted index
         if keywords:
-            search_result = await self.search_topics(keywords[0])
-            if search_result["success"]:
-                for result in search_result["results"][:5]:
-                    if result["path"] != topic_path and result["path"] not in related_paths:
-                        related.append({
-                            "path": result["path"],
-                            "title": result.get("title", result["path"]),
-                            "relation": "keyword_similarity"
-                        })
+            inv_result = await self.get_inverted_index()
+            if inv_result["success"]:
+                inv_index = inv_result["index"]
+                similar_ids: Set[str] = set()
+
+                for keyword in keywords[:3]:  # Check first 3 keywords
+                    kw_lower = keyword.lower()
+                    if kw_lower in inv_index.get("keywords", {}):
+                        similar_ids.update(inv_index["keywords"][kw_lower])
+
+                # Add similar topics (limit to 5)
+                for similar_id in list(similar_ids)[:5]:
+                    if similar_id != topic_path and similar_id not in related_paths:
+                        if similar_id in topics_data:
+                            related.append({
+                                "path": similar_id,
+                                "title": topics_data[similar_id].get("title", similar_id),
+                                "relation": "keyword_similarity"
+                            })
 
         return {
             "success": True,
@@ -465,87 +782,33 @@ class KnowledgeBaseTools:
         }
 
     # =========================================================================
-    # Index Management
-    # =========================================================================
-
-    async def rebuild_index(self) -> Dict[str, Any]:
-        """Rebuild the topics index from metadata files.
-
-        Returns:
-            Dict with index stats
-        """
-        all_meta = await self.storage.list("topics", "*.meta.json")
-
-        if not all_meta.success:
-            return {"success": False, "error": all_meta.error}
-
-        index = {
-            "rebuilt_at": datetime.utcnow().isoformat() + "Z",
-            "topics": {}
-        }
-
-        for meta_path in all_meta.data:
-            meta_result = await self.storage.read_json(meta_path)
-            if meta_result.success:
-                meta = meta_result.data
-                topic_id = meta.get("topic_id")
-                if topic_id:
-                    index["topics"][topic_id] = {
-                        "title": meta.get("title"),
-                        "keywords": meta.get("keywords", []),
-                        "last_modified": meta.get("last_modified")
-                    }
-
-        result = await self.storage.write_json("_index/topics_index.json", index)
-
-        return {
-            "success": result.success,
-            "topic_count": len(index["topics"]),
-            "message": f"Index rebuilt with {len(index['topics'])} topics"
-        }
-
-    async def get_index(self) -> Dict[str, Any]:
-        """Get the current topics index.
-
-        Returns:
-            Dict with index data
-        """
-        result = await self.storage.read_json("_index/topics_index.json")
-
-        if result.success:
-            return {
-                "success": True,
-                "index": result.data
-            }
-        else:
-            # Try to rebuild if not found
-            return await self.rebuild_index()
-
-    # =========================================================================
     # Statistics
     # =========================================================================
 
     async def get_stats(self) -> Dict[str, Any]:
-        """Get knowledge base statistics.
+        """Get knowledge base statistics using index.
 
         Returns:
             Dict with various statistics
         """
-        topics_result = await self.storage.list("topics", "*.md")
+        index_result = await self.get_index()
+        inv_result = await self.get_inverted_index()
+
+        topics_count = 0
+        categories = []
+
+        if index_result["success"]:
+            topics_count = len(index_result["index"].get("topics", {}))
+
+        if inv_result["success"]:
+            categories = list(inv_result["index"].get("categories", {}).keys())
+
+        # Count citations and logs (these are small, OK to list)
         citations_result = await self.storage.list("citations", "*.json")
         logs_result = await self.storage.list("logs", "*.json")
 
-        topics_count = len(topics_result.data) if topics_result.success else 0
         citations_count = len(citations_result.data) if citations_result.success else 0
         logs_count = len(logs_result.data) if logs_result.success else 0
-
-        # Get categories
-        categories = set()
-        if topics_result.success:
-            for path in topics_result.data:
-                parts = path.split("/")
-                if len(parts) > 2:
-                    categories.add(parts[1])
 
         return {
             "success": True,
@@ -553,6 +816,6 @@ class KnowledgeBaseTools:
                 "total_topics": topics_count,
                 "total_citations": citations_count,
                 "total_logs": logs_count,
-                "categories": sorted(list(categories))
+                "categories": sorted(categories)
             }
         }
