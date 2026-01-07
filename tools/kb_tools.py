@@ -308,6 +308,10 @@ class KnowledgeBaseTools:
     ) -> Dict[str, Any]:
         """Write or update a topic in the knowledge base.
 
+        Uses pessimistic locking to ensure only one agent can write
+        to a topic at a time. Like checking out a document from a
+        filing cabinet.
+
         Args:
             topic_path: Path relative to topics/ (e.g., "python/gil")
             content: Markdown content
@@ -324,62 +328,72 @@ class KnowledgeBaseTools:
         md_path = f"topics/{topic_path}.md"
         meta_path = f"topics/{topic_path}.meta.json"
 
-        # Check existing metadata for version
-        existing_meta = await self.storage.read_json(meta_path)
-        version = 1
-        existing_citations = []
-        old_keywords = []
-        old_title = ""
-        if existing_meta.success:
-            version = existing_meta.data.get("version", 0) + 1
-            existing_citations = existing_meta.data.get("citations", [])
-            old_keywords = existing_meta.data.get("keywords", [])
-            old_title = existing_meta.data.get("title", "")
+        # Acquire exclusive lock on the topic file
+        async with self.storage.locked(md_path, agent_id, timeout_seconds=60.0) as lock:
+            if not lock.success:
+                return {
+                    "success": False,
+                    "error": f"Cannot acquire lock: {lock.error}",
+                    "locked_by": lock.data.get("holder_id") if lock.data else None
+                }
 
-        # Write content with optimistic concurrency
-        write_result = await self.storage.write(md_path, content, etag)
-        if not write_result.success:
-            return {
-                "success": False,
-                "error": write_result.error,
-                "etag": write_result.etag
+            # Check existing metadata for version
+            existing_meta = await self.storage.read_json(meta_path)
+            version = 1
+            existing_citations = []
+            old_keywords = []
+            old_title = ""
+            if existing_meta.success:
+                version = existing_meta.data.get("version", 0) + 1
+                existing_citations = existing_meta.data.get("citations", [])
+                old_keywords = existing_meta.data.get("keywords", [])
+                old_title = existing_meta.data.get("title", "")
+
+            # Write content (lock ensures exclusive access)
+            write_result = await self.storage.write(md_path, content, etag)
+            if not write_result.success:
+                return {
+                    "success": False,
+                    "error": write_result.error,
+                    "etag": write_result.etag
+                }
+
+            # Merge citations
+            all_citations = list(set(existing_citations + (citations or [])))
+
+            # Write metadata
+            metadata = {
+                "topic_id": topic_path,
+                "title": title,
+                "version": version,
+                "etag": write_result.etag,
+                "last_modified": datetime.utcnow().isoformat() + "Z",
+                "last_modified_by": agent_id,
+                "citations": all_citations,
+                "related_topics": related_topics or [],
+                "keywords": keywords
             }
 
-        # Merge citations
-        all_citations = list(set(existing_citations + (citations or [])))
+            meta_result = await self.storage.write_json(meta_path, metadata)
+            if not meta_result.success:
+                return {
+                    "success": False,
+                    "error": f"Failed to write metadata: {meta_result.error}"
+                }
 
-        # Write metadata
-        metadata = {
-            "topic_id": topic_path,
-            "title": title,
-            "version": version,
-            "etag": write_result.etag,
-            "last_modified": datetime.utcnow().isoformat() + "Z",
-            "last_modified_by": agent_id,
-            "citations": all_citations,
-            "related_topics": related_topics or [],
-            "keywords": keywords
-        }
+            # Update indexes incrementally
+            if old_keywords or old_title:
+                await self._update_indexes_for_topic(topic_path, old_title, old_keywords, remove=True)
+            await self._update_indexes_for_topic(topic_path, title, keywords, remove=False)
 
-        meta_result = await self.storage.write_json(meta_path, metadata)
-        if not meta_result.success:
             return {
-                "success": False,
-                "error": f"Failed to write metadata: {meta_result.error}"
+                "success": True,
+                "path": topic_path,
+                "etag": write_result.etag,
+                "version": version,
+                "message": f"Topic '{title}' saved successfully"
             }
-
-        # Update indexes incrementally
-        if old_keywords or old_title:
-            await self._update_indexes_for_topic(topic_path, old_title, old_keywords, remove=True)
-        await self._update_indexes_for_topic(topic_path, title, keywords, remove=False)
-
-        return {
-            "success": True,
-            "path": topic_path,
-            "etag": write_result.etag,
-            "version": version,
-            "message": f"Topic '{title}' saved successfully"
-        }
+        # Lock is automatically released when exiting the context manager
 
     async def append_to_topic(
         self,
@@ -424,43 +438,55 @@ class KnowledgeBaseTools:
             agent_id=agent_id
         )
 
-    async def delete_topic(self, topic_path: str) -> Dict[str, Any]:
+    async def delete_topic(self, topic_path: str, agent_id: str = "unknown") -> Dict[str, Any]:
         """Delete a topic from the knowledge base.
+
+        Uses pessimistic locking to ensure safe deletion.
 
         Args:
             topic_path: Path relative to topics/
+            agent_id: ID of the agent performing deletion
 
         Returns:
             Dict with success status
         """
-        # Get metadata for index cleanup
-        meta_result = await self.storage.read_json(f"topics/{topic_path}.meta.json")
-        old_title = ""
-        old_keywords = []
-        if meta_result.success:
-            old_title = meta_result.data.get("title", "")
-            old_keywords = meta_result.data.get("keywords", [])
-
         md_path = f"topics/{topic_path}.md"
         meta_path = f"topics/{topic_path}.meta.json"
 
-        # Parallel delete
-        md_task = self.storage.delete(md_path)
-        meta_task = self.storage.delete(meta_path)
-        md_result, meta_result = await asyncio.gather(md_task, meta_task)
+        # Acquire exclusive lock before deletion
+        async with self.storage.locked(md_path, agent_id, timeout_seconds=30.0) as lock:
+            if not lock.success:
+                return {
+                    "success": False,
+                    "error": f"Cannot acquire lock for deletion: {lock.error}",
+                    "locked_by": lock.data.get("holder_id") if lock.data else None
+                }
 
-        if md_result.success:
-            # Update indexes
-            await self._update_indexes_for_topic(topic_path, old_title, old_keywords, remove=True)
-            return {
-                "success": True,
-                "message": f"Topic '{topic_path}' deleted"
-            }
-        else:
-            return {
-                "success": False,
-                "error": md_result.error
-            }
+            # Get metadata for index cleanup
+            meta_result = await self.storage.read_json(meta_path)
+            old_title = ""
+            old_keywords = []
+            if meta_result.success:
+                old_title = meta_result.data.get("title", "")
+                old_keywords = meta_result.data.get("keywords", [])
+
+            # Parallel delete
+            md_task = self.storage.delete(md_path)
+            meta_task = self.storage.delete(meta_path)
+            md_result, meta_result = await asyncio.gather(md_task, meta_task)
+
+            if md_result.success:
+                # Update indexes
+                await self._update_indexes_for_topic(topic_path, old_title, old_keywords, remove=True)
+                return {
+                    "success": True,
+                    "message": f"Topic '{topic_path}' deleted"
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": md_result.error
+                }
 
     # =========================================================================
     # Search and Discovery (Optimized with Indexes)
