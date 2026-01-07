@@ -6,21 +6,52 @@ Claude Agent SDK 기반의 파일 지식 베이스 관리 CLI 도구입니다.
 
 문서를 입력받아 파일 기반 지식 베이스를 구축하고, AI 에이전트를 통해 질의응답을 수행하는 시스템입니다.
 
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
-│   문서 입력   │ ──▶ │  Ingest Agent │ ──▶ │  Knowledge Base  │
-│ (.txt, .md)  │     │  (Claude AI)  │     │   (File-based)   │
-└─────────────┘     └──────────────┘     └────────┬────────┘
-                                                   │
-┌─────────────┐     ┌──────────────┐               │
-│    질문      │ ──▶ │ Analysis Agent│ ◀────────────┘
-│             │     │  (Claude AI)  │
-└─────────────┘     └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │     답변      │
-                    │  (Citations)  │
-                    └──────────────┘
+```mermaid
+flowchart LR
+    subgraph input ["📄 입력"]
+        DOC["문서<br/>.txt .md .html"]
+        Q["질문"]
+    end
+
+    subgraph agents ["🤖 Claude Agents"]
+        IA["Ingest Agent<br/>문서 분석 & 청킹"]
+        AA["Analysis Agent<br/>검색 & 답변 생성"]
+    end
+
+    subgraph kb ["💾 Knowledge Base"]
+        direction TB
+        TOPICS[("topics/<br/>토픽 파일")]
+        INDEX[("_index/<br/>검색 인덱스")]
+        CITE[("citations/<br/>출처 추적")]
+    end
+
+    subgraph output ["✨ 출력"]
+        ANS["답변<br/>+ Citations"]
+    end
+
+    DOC --> IA
+    IA --> TOPICS
+    IA --> INDEX
+    IA --> CITE
+
+    Q --> AA
+    TOPICS --> AA
+    INDEX --> AA
+    AA --> ANS
+
+    style input fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style agents fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style kb fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+    style output fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+
+    style DOC fill:#c8e6c9,stroke:#2e7d32
+    style Q fill:#c8e6c9,stroke:#2e7d32
+    style IA fill:#90caf9,stroke:#1565c0
+    style AA fill:#90caf9,stroke:#1565c0
+    style TOPICS fill:#ffe0b2,stroke:#ef6c00
+    style INDEX fill:#ffe0b2,stroke:#ef6c00
+    style CITE fill:#ffe0b2,stroke:#ef6c00
+    style ANS fill:#f8bbd9,stroke:#c2185b
 ```
 
 ## 빠른 시작
