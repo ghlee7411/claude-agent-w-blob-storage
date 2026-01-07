@@ -5,8 +5,9 @@ Implementations can include filesystem, Azure Blob, AWS S3, etc.
 """
 
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, AsyncGenerator
 import json
 
 
@@ -17,6 +18,7 @@ class StorageResult:
     data: Optional[Any] = None
     error: Optional[str] = None
     etag: Optional[str] = None
+    lock_id: Optional[str] = None  # For lock operations
 
     def to_dict(self) -> dict:
         return {
@@ -149,3 +151,102 @@ class BaseStorage(ABC):
             return await self.write(path, content, etag)
         except (TypeError, ValueError) as e:
             return StorageResult(success=False, error=f"JSON serialize error: {e}")
+
+    # =========================================================================
+    # Locking Operations (Pessimistic Concurrency Control)
+    # =========================================================================
+
+    async def acquire_lock(
+        self,
+        path: str,
+        holder_id: str,
+        timeout_seconds: float = 30.0,
+        wait: bool = True,
+        wait_timeout: float = 60.0
+    ) -> StorageResult:
+        """Acquire an exclusive lock on a file/blob.
+
+        Like checking out a document from a filing cabinet - only one
+        agent can hold the lock at a time.
+
+        Args:
+            path: Path to the file/blob to lock
+            holder_id: Unique identifier of the lock holder (e.g., agent_id)
+            timeout_seconds: Lock auto-expires after this duration (prevents deadlocks)
+            wait: If True, wait for lock to become available; if False, fail immediately
+            wait_timeout: Maximum time to wait for lock (only if wait=True)
+
+        Returns:
+            StorageResult with lock_id on success, error if lock unavailable
+        """
+        raise NotImplementedError("Subclasses must implement acquire_lock")
+
+    async def release_lock(self, path: str, lock_id: str) -> StorageResult:
+        """Release a previously acquired lock.
+
+        Like returning a document to the filing cabinet.
+
+        Args:
+            path: Path to the locked file/blob
+            lock_id: Lock ID returned from acquire_lock
+
+        Returns:
+            StorageResult indicating success/failure
+        """
+        raise NotImplementedError("Subclasses must implement release_lock")
+
+    async def check_lock(self, path: str) -> StorageResult:
+        """Check the lock status of a file/blob.
+
+        Args:
+            path: Path to check
+
+        Returns:
+            StorageResult with lock info (holder_id, expires_at) or None if unlocked
+        """
+        raise NotImplementedError("Subclasses must implement check_lock")
+
+    async def force_unlock(self, path: str) -> StorageResult:
+        """Force release a lock (admin operation).
+
+        Use with caution - only for recovery from stuck locks.
+
+        Args:
+            path: Path to unlock
+
+        Returns:
+            StorageResult indicating success/failure
+        """
+        raise NotImplementedError("Subclasses must implement force_unlock")
+
+    @asynccontextmanager
+    async def locked(
+        self,
+        path: str,
+        holder_id: str,
+        timeout_seconds: float = 30.0
+    ) -> AsyncGenerator[StorageResult, None]:
+        """Context manager for safe lock acquisition and release.
+
+        Usage:
+            async with storage.locked("topics/python/gil.md", "agent-123") as lock:
+                if lock.success:
+                    # safely read/modify/write the file
+                    pass
+
+        Args:
+            path: Path to lock
+            holder_id: Unique identifier of the lock holder
+            timeout_seconds: Lock auto-expires after this duration
+
+        Yields:
+            StorageResult from acquire_lock
+        """
+        lock_result = await self.acquire_lock(
+            path, holder_id, timeout_seconds, wait=True
+        )
+        try:
+            yield lock_result
+        finally:
+            if lock_result.success and lock_result.lock_id:
+                await self.release_lock(path, lock_result.lock_id)
