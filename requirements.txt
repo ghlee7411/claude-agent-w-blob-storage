@@ -1,0 +1,10 @@
+# Claude Agent SDK dependencies
+anthropic>=0.18.0
+
+# File and data handling
+pathlib
+json5
+
+# Optional: for future blob storage integration
+# azure-storage-blob>=12.0.0
+# boto3>=1.26.0  # for AWS S3
