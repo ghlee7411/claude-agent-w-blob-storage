@@ -1,9 +1,15 @@
-# Claude Agent SDK dependencies
-anthropic>=0.18.0
+# Claude Agent SDK (main dependency)
+claude-agent-sdk>=0.1.0
 
-# File and data handling
-pathlib
-json5
+# CLI framework
+typer>=0.9.0
+rich>=13.0.0
+
+# Async support
+anyio>=4.0.0
+
+# Optional: Standard Anthropic SDK (fallback)
+anthropic>=0.18.0
 
 # Optional: for future blob storage integration
 # azure-storage-blob>=12.0.0
