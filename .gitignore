@@ -32,8 +32,8 @@ env/
 *.swo
 *~
 
-# Storage data
-storage/
+# Storage data (knowledge base content, not Python module)
+knowledge_base/
 data/
 *.db
 
