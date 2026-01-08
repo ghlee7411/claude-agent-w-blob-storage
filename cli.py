@@ -470,6 +470,35 @@ def migrate_index_v2(
 
 
 @app.command()
+def migrate_index_v3(
+    kb_path: str = typer.Option(DEFAULT_KB_PATH, "--kb", "-k", help="Knowledge base path")
+):
+    """
+    Migrate index from v2.0 (sharded) to v3.0 (2-tier).
+
+    This further reduces I/O by 99%+ for 1M-10M scale knowledge bases.
+    - Keyword 2-tier lookup: 48MB → 70KB
+    - More topic shards: 350MB → 3.5MB per shard
+    """
+    script_path = Path(__file__).parent / "scripts" / "migrate_index_v3.py"
+
+    if not script_path.exists():
+        console.print(f"[red]Error:[/red] Migration script not found: {script_path}")
+        raise typer.Exit(1)
+
+    console.print("[bold]Starting index migration to v3.0...[/bold]")
+    console.print()
+
+    # Run migration script
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--kb-path", kb_path],
+        check=False
+    )
+
+    sys.exit(result.returncode)
+
+
+@app.command()
 def init(
     kb_path: str = typer.Option(DEFAULT_KB_PATH, "--kb", "-k", help="Knowledge base path")
 ):
