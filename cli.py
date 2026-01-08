@@ -8,6 +8,11 @@ Supports two main modes:
 - analysis: Query the knowledge base
 """
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 import asyncio
 import sys
 from pathlib import Path
