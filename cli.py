@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, List
@@ -439,6 +440,33 @@ def rebuild_index(
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+def migrate_index_v2(
+    kb_path: str = typer.Option(DEFAULT_KB_PATH, "--kb", "-k", help="Knowledge base path")
+):
+    """
+    Migrate index from v1.0 (monolithic) to v2.0 (sharded).
+
+    This reduces I/O and token usage by 90-98% for large knowledge bases.
+    """
+    script_path = Path(__file__).parent / "scripts" / "migrate_index_v2.py"
+
+    if not script_path.exists():
+        console.print(f"[red]Error:[/red] Migration script not found: {script_path}")
+        raise typer.Exit(1)
+
+    console.print("[bold]Starting index migration to v2.0...[/bold]")
+    console.print()
+
+    # Run migration script
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--kb-path", kb_path],
+        check=False
+    )
+
+    sys.exit(result.returncode)
 
 
 @app.command()
